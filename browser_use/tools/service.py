@@ -27,8 +27,13 @@ from browser_use.browser.events import (
 	UploadFileEvent,
 )
 from browser_use.browser.views import BrowserError
-from browser_use.controller.registry.service import Registry
-from browser_use.controller.views import (
+from browser_use.dom.service import EnhancedDOMTreeNode
+from browser_use.filesystem.file_system import FileSystem
+from browser_use.llm.base import BaseChatModel
+from browser_use.llm.messages import UserMessage
+from browser_use.observability import observe_debug
+from browser_use.tools.registry.service import Registry
+from browser_use.tools.views import (
 	ClickElementAction,
 	CloseTabAction,
 	DoneAction,
@@ -44,11 +49,6 @@ from browser_use.controller.views import (
 	SwitchTabAction,
 	UploadFileAction,
 )
-from browser_use.dom.service import EnhancedDOMTreeNode
-from browser_use.filesystem.file_system import FileSystem
-from browser_use.llm.base import BaseChatModel
-from browser_use.llm.messages import UserMessage
-from browser_use.observability import observe_debug
 from browser_use.utils import _log_pretty_url, time_execution_sync
 
 logger = logging.getLogger(__name__)
@@ -87,7 +87,7 @@ def extract_llm_error_message(error: Exception) -> str:
 	return error_str
 
 
-class Controller(Generic[Context]):
+class Tools(Generic[Context]):
 	def __init__(
 		self,
 		exclude_actions: list[str] = [],
@@ -177,7 +177,7 @@ class Controller(Generic[Context]):
 				memory = f"Searched Google for '{params.query}'"
 				msg = f'🔍  {memory}'
 				logger.info(msg)
-				return ActionResult(extracted_content=memory, include_in_memory=True, long_term_memory=memory)
+				return ActionResult(extracted_content=memory, long_term_memory=memory)
 			except Exception as e:
 				logger.error(f'Failed to search Google: {e}')
 				clean_msg = extract_llm_error_message(e)
@@ -201,7 +201,7 @@ class Controller(Generic[Context]):
 					msg = f'🔗 {memory}'
 
 				logger.info(msg)
-				return ActionResult(extracted_content=msg, include_in_memory=True, long_term_memory=memory)
+				return ActionResult(extracted_content=msg, long_term_memory=memory)
 			except Exception as e:
 				error_msg = str(e)
 				# Always log the actual error first for debugging
@@ -285,13 +285,13 @@ class Controller(Generic[Context]):
 				# Wait for handler to complete and get any exception or metadata
 				click_metadata = await event.event_result(raise_if_any=True, raise_if_none=False)
 				memory = f'Clicked element with index {params.index}'
+				if params.while_holding_ctrl:
+					memory += ' and opened in new tab'
 				msg = f'🖱️ {memory}'
 				logger.info(msg)
 
 				# Include click coordinates in metadata if available
 				return ActionResult(
-					extracted_content=memory,
-					include_in_memory=True,
 					long_term_memory=memory,
 					metadata=click_metadata if isinstance(click_metadata, dict) else None,
 				)
@@ -336,7 +336,6 @@ class Controller(Generic[Context]):
 				# Include input coordinates in metadata if available
 				return ActionResult(
 					extracted_content=msg,
-					include_in_memory=True,
 					long_term_memory=f"Input '{params.text}' into element {params.index}.",
 					metadata=input_metadata if isinstance(input_metadata, dict) else None,
 				)
@@ -486,7 +485,6 @@ class Controller(Generic[Context]):
 				logger.info(f'📁 {msg}')
 				return ActionResult(
 					extracted_content=msg,
-					include_in_memory=True,
 					long_term_memory=f'Uploaded file {params.path} to element {params.index}',
 				)
 			except Exception as e:
@@ -499,12 +497,7 @@ class Controller(Generic[Context]):
 		async def switch_tab(params: SwitchTabAction, browser_session: BrowserSession):
 			# Dispatch switch tab event
 			try:
-				if params.tab_id:
-					target_id = await browser_session.get_target_id_from_tab_id(params.tab_id)
-				elif params.url:
-					target_id = await browser_session.get_target_id_from_url(params.url)
-				else:
-					target_id = await browser_session.get_most_recently_opened_target_id()
+				target_id = await browser_session.get_target_id_from_tab_id(params.tab_id)
 
 				event = browser_session.event_bus.dispatch(SwitchTabEvent(target_id=target_id))
 				await event
@@ -512,11 +505,11 @@ class Controller(Generic[Context]):
 				assert new_target_id, 'SwitchTabEvent did not return a TargetID for the new tab that was switched to'
 				memory = f'Switched to Tab with ID {new_target_id[-4:]}'
 				logger.info(f'🔄  {memory}')
-				return ActionResult(extracted_content=memory, include_in_memory=True, long_term_memory=memory)
+				return ActionResult(extracted_content=memory, long_term_memory=memory)
 			except Exception as e:
 				logger.error(f'Failed to switch tab: {type(e).__name__}: {e}')
 				clean_msg = extract_llm_error_message(e)
-				return ActionResult(error=f'Failed to switch to tab {params.tab_id or params.url}: {clean_msg}')
+				return ActionResult(error=f'Failed to switch to tab {params.tab_id}: {clean_msg}')
 
 		@self.registry.action('Close an existing tab', param_model=CloseTabAction)
 		async def close_tab(params: CloseTabAction, browser_session: BrowserSession):
@@ -535,7 +528,6 @@ class Controller(Generic[Context]):
 				logger.info(f'🗑️  {memory}')
 				return ActionResult(
 					extracted_content=memory,
-					include_in_memory=True,
 					long_term_memory=memory,
 				)
 			except Exception as e:
@@ -697,7 +689,7 @@ Provide the extracted information in a clear, structured format."""
 
 				msg = f'🔍 {long_term_memory}'
 				logger.info(msg)
-				return ActionResult(extracted_content=msg, include_in_memory=True, long_term_memory=long_term_memory)
+				return ActionResult(extracted_content=msg, long_term_memory=long_term_memory)
 			except Exception as e:
 				logger.error(f'Failed to dispatch ScrollEvent: {type(e).__name__}: {e}')
 				clean_msg = extract_llm_error_message(e)
@@ -705,7 +697,7 @@ Provide the extracted information in a clear, structured format."""
 				return ActionResult(error=error_msg)
 
 		@self.registry.action(
-			'Send strings of special keys to use Playwright page.keyboard.press - examples include Escape, Backspace, Insert, PageDown, Delete, Enter, or Shortcuts such as `Control+o`, `Control+Shift+T`',
+			'Send strings of special keys to use e.g. Escape, Backspace, Insert, PageDown, Delete, Enter, or Shortcuts such as `Control+o`, `Control+Shift+T`',
 			param_model=SendKeysAction,
 		)
 		async def send_keys(params: SendKeysAction, browser_session: BrowserSession):
@@ -717,7 +709,7 @@ Provide the extracted information in a clear, structured format."""
 				memory = f'Sent keys: {params.keys}'
 				msg = f'⌨️  {memory}'
 				logger.info(msg)
-				return ActionResult(extracted_content=memory, include_in_memory=True, long_term_memory=memory)
+				return ActionResult(extracted_content=memory, long_term_memory=memory)
 			except Exception as e:
 				logger.error(f'Failed to dispatch SendKeysEvent: {type(e).__name__}: {e}')
 				clean_msg = extract_llm_error_message(e)
@@ -737,14 +729,13 @@ Provide the extracted information in a clear, structured format."""
 				memory = f'Scrolled to text: {text}'
 				msg = f'🔍  {memory}'
 				logger.info(msg)
-				return ActionResult(extracted_content=memory, include_in_memory=True, long_term_memory=memory)
+				return ActionResult(extracted_content=memory, long_term_memory=memory)
 			except Exception as e:
 				# Text not found
 				msg = f"Text '{text}' not found or not visible on page"
 				logger.info(msg)
 				return ActionResult(
 					extracted_content=msg,
-					include_in_memory=True,
 					long_term_memory=f"Tried scrolling to text '{text}' but it was not found",
 				)
 
@@ -776,7 +767,6 @@ Provide the extracted information in a clear, structured format."""
 
 			return ActionResult(
 				extracted_content=msg,
-				include_in_memory=True,
 				long_term_memory=f'Found {options_count} dropdown options for index {params.index}',
 				include_extracted_content_only_once=True,
 			)
@@ -806,7 +796,6 @@ Provide the extracted information in a clear, structured format."""
 
 			return ActionResult(
 				extracted_content=msg,
-				include_in_memory=True,
 				long_term_memory=f"Selected dropdown option '{params.text}' at index {params.index}",
 			)
 
@@ -831,7 +820,7 @@ Provide the extracted information in a clear, structured format."""
 			else:
 				result = await file_system.write_file(file_name, content)
 			logger.info(f'💾 {result}')
-			return ActionResult(extracted_content=result, include_in_memory=True, long_term_memory=result)
+			return ActionResult(extracted_content=result, long_term_memory=result)
 
 		@self.registry.action(
 			'Replace old_str with new_str in file_name. old_str must exactly match the string to replace in original text. Recommended tool to mark completed items in todo.md or change specific contents in a file.'
@@ -839,7 +828,7 @@ Provide the extracted information in a clear, structured format."""
 		async def replace_file_str(file_name: str, old_str: str, new_str: str, file_system: FileSystem):
 			result = await file_system.replace_file_str(file_name, old_str, new_str)
 			logger.info(f'💾 {result}')
-			return ActionResult(extracted_content=result, include_in_memory=True, long_term_memory=result)
+			return ActionResult(extracted_content=result, long_term_memory=result)
 
 		@self.registry.action('Read file_name from file system')
 		async def read_file(file_name: str, available_file_paths: list[str], file_system: FileSystem):
@@ -866,123 +855,9 @@ Provide the extracted information in a clear, structured format."""
 			logger.info(f'💾 {memory}')
 			return ActionResult(
 				extracted_content=result,
-				include_in_memory=True,
 				long_term_memory=memory,
 				include_extracted_content_only_once=True,
 			)
-
-	# @self.registry.action('Google Sheets: Get the contents of the entire sheet', domains=['https://docs.google.com'])
-	# async def read_sheet_contents(browser_session: BrowserSession):
-	# 	# Use send keys events to select and copy all cells
-	# 	for key in ['Enter', 'Escape', 'ControlOrMeta+A', 'ControlOrMeta+C']:
-	# 		event = browser_session.event_bus.dispatch(SendKeysEvent(keys=key))
-	# 		await event
-
-	# 	# Get page to evaluate clipboard
-	# 	page = await browser_session.get_current_page()
-	# 	extracted_tsv = await page.evaluate('() => navigator.clipboard.readText()')
-	# 	return ActionResult(
-	# 		extracted_content=extracted_tsv,
-	# 		include_in_memory=True,
-	# 		long_term_memory='Retrieved sheet contents',
-	# 		include_extracted_content_only_once=True,
-	# 	)
-
-	# @self.registry.action('Google Sheets: Get the contents of a cell or range of cells', domains=['https://docs.google.com'])
-	# async def read_cell_contents(cell_or_range: str, browser_session: BrowserSession):
-	# 	page = await browser_session.get_current_page()
-
-	# 	await select_cell_or_range(cell_or_range=cell_or_range, page=page)
-
-	# 	await page.keyboard.press('ControlOrMeta+C')
-	# 	await asyncio.sleep(0.1)
-	# 	extracted_tsv = await page.evaluate('() => navigator.clipboard.readText()')
-	# 	return ActionResult(
-	# 		extracted_content=extracted_tsv,
-	# 		include_in_memory=True,
-	# 		long_term_memory=f'Retrieved contents from {cell_or_range}',
-	# 		include_extracted_content_only_once=True,
-	# 	)
-
-	# @self.registry.action(
-	# 	'Google Sheets: Update the content of a cell or range of cells', domains=['https://docs.google.com']
-	# )
-	# async def update_cell_contents(cell_or_range: str, new_contents_tsv: str, browser_session: BrowserSession):
-	# 	page = await browser_session.get_current_page()
-
-	# 	await select_cell_or_range(cell_or_range=cell_or_range, page=page)
-
-	# 	# simulate paste event from clipboard with TSV content
-	# 	await page.evaluate(f"""
-	# 		const clipboardData = new DataTransfer();
-	# 		clipboardData.setData('text/plain', `{new_contents_tsv}`);
-	# 		document.activeElement.dispatchEvent(new ClipboardEvent('paste', {{clipboardData}}));
-	# 	""")
-
-	# 	return ActionResult(
-	# 		extracted_content=f'Updated cells: {cell_or_range} = {new_contents_tsv}',
-	# 		include_in_memory=False,
-	# 		long_term_memory=f'Updated cells {cell_or_range} with {new_contents_tsv}',
-	# 	)
-
-	# @self.registry.action('Google Sheets: Clear whatever cells are currently selected', domains=['https://docs.google.com'])
-	# async def clear_cell_contents(cell_or_range: str, browser_session: BrowserSession):
-	# 	page = await browser_session.get_current_page()
-
-	# 	await select_cell_or_range(cell_or_range=cell_or_range, page=page)
-
-	# 	await page.keyboard.press('Backspace')
-	# 	return ActionResult(
-	# 		extracted_content=f'Cleared cells: {cell_or_range}',
-	# 		include_in_memory=False,
-	# 		long_term_memory=f'Cleared cells {cell_or_range}',
-	# 	)
-
-	# @self.registry.action('Google Sheets: Select a specific cell or range of cells', domains=['https://docs.google.com'])
-	# async def select_cell_or_range(cell_or_range: str, browser_session: BrowserSession):
-	# 	# Use send keys events for navigation
-	# 	for key in ['Enter', 'Escape']:
-	# 		event = browser_session.event_bus.dispatch(SendKeysEvent(keys=key))
-	# 		await event
-	# 	await asyncio.sleep(0.1)
-	# 	for key in ['Home', 'ArrowUp']:
-	# 		event = browser_session.event_bus.dispatch(SendKeysEvent(keys=key))
-	# 		await event
-	# 	await asyncio.sleep(0.1)
-	# 	event = browser_session.event_bus.dispatch(SendKeysEvent(keys='Control+G'))
-	# 	await event
-	# 	await asyncio.sleep(0.2)
-	# 	# Get page to type the cell range
-	# 	page = await browser_session.get_current_page()
-	# 	await page.keyboard.type(cell_or_range, delay=0.05)
-	# 	await asyncio.sleep(0.2)
-	# 	for key in ['Enter', 'Escape']:
-	# 		event = browser_session.event_bus.dispatch(SendKeysEvent(keys=key))
-	# 		await event
-	# 		await asyncio.sleep(0.2)
-	# 	return ActionResult(
-	# 		extracted_content=f'Selected cells: {cell_or_range}',
-	# 		include_in_memory=False,
-	# 		long_term_memory=f'Selected cells {cell_or_range}',
-	# 	)
-
-	# @self.registry.action(
-	# 	'Google Sheets: Fallback method to type text into (only one) currently selected cell',
-	# 	domains=['https://docs.google.com'],
-	# )
-	# async def fallback_input_into_single_selected_cell(text: str, browser_session: BrowserSession):
-	# 	# Get page to type text
-	# 	page = await browser_session.get_current_page()
-	# 	await page.keyboard.type(text, delay=0.1)
-	# 	# Use send keys for Enter and ArrowUp
-	# 	for key in ['Enter', 'ArrowUp']:
-	# 		event = browser_session.event_bus.dispatch(SendKeysEvent(keys=key))
-	# 		await event
-	# 	return ActionResult(
-	# 		extracted_content=f'Inputted text {text}',
-	# 		include_in_memory=False,
-	# 		long_term_memory=f"Inputted text '{text}' into cell",
-	# 	)
 
 	# Custom done action for structured output
 	def _register_done_action(self, output_model: type[T] | None, display_files_in_done_text: bool = True):
@@ -1082,8 +957,6 @@ Provide the extracted information in a clear, structured format."""
 		sensitive_data: dict[str, str | dict[str, str]] | None = None,
 		available_file_paths: list[str] | None = None,
 		file_system: FileSystem | None = None,
-		#
-		context: Context | None = None,
 	) -> ActionResult:
 		"""Execute an action"""
 
@@ -1115,7 +988,6 @@ Provide the extracted information in a clear, structured format."""
 							file_system=file_system,
 							sensitive_data=sensitive_data,
 							available_file_paths=available_file_paths,
-							context=context,
 						)
 					except Exception as e:
 						# Log the original exception with traceback for observability
@@ -1136,3 +1008,7 @@ Provide the extracted information in a clear, structured format."""
 				else:
 					raise ValueError(f'Invalid action result type: {type(result)} of {result}')
 		return ActionResult()
+
+
+# Alias for backwards compatibility
+Controller = Tools

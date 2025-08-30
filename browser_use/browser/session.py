@@ -39,7 +39,8 @@ from browser_use.browser.events import (
 from browser_use.browser.profile import BrowserProfile, ProxySettings
 from browser_use.browser.views import BrowserStateSummary, TabInfo
 from browser_use.dom.views import EnhancedDOMTreeNode, TargetInfo
-from browser_use.utils import _log_pretty_url, is_new_tab_page
+from browser_use.observability import observe_debug
+from browser_use.utils import _log_pretty_url, is_new_tab_page, time_execution_async
 
 DEFAULT_BROWSER_PROFILE = BrowserProfile()
 
@@ -188,7 +189,7 @@ class BrowserSession(BaseModel):
 	"""Event-driven browser session with backwards compatibility.
 
 	This class provides a 2-layer architecture:
-	- High-level event handling for agents/controllers
+	- High-level event handling for agents/tools
 	- Direct CDP/Playwright calls for browser operations
 
 	Supports both event-driven and imperative calling styles.
@@ -203,7 +204,6 @@ class BrowserSession(BaseModel):
 
 	# Access session fields directly, browser settings via profile or property
 	print(session.id)  # Session field
-	print(session.browser_profile.stealth)  # Direct browser_profile access
 	```
 	"""
 
@@ -219,13 +219,11 @@ class BrowserSession(BaseModel):
 		# Core configuration
 		id: str | None = None,
 		cdp_url: str | None = None,
-		is_local: bool = True,
+		is_local: bool = False,
 		browser_profile: BrowserProfile | None = None,
 		# BrowserProfile fields that can be passed directly
 		# From BrowserConnectArgs
 		headers: dict[str, str] | None = None,
-		slow_mo: float | None = None,
-		timeout: float | None = None,
 		# From BrowserLaunchArgs
 		env: dict[str, str | float | bool] | None = None,
 		executable_path: str | Path | None = None,
@@ -237,46 +235,23 @@ class BrowserSession(BaseModel):
 		devtools: bool | None = None,
 		downloads_path: str | Path | None = None,
 		traces_dir: str | Path | None = None,
-		handle_sighup: bool | None = None,
-		handle_sigint: bool | None = None,
-		handle_sigterm: bool | None = None,
 		# From BrowserContextArgs
 		accept_downloads: bool | None = None,
-		offline: bool | None = None,
-		strict_selectors: bool | None = None,
 		permissions: list[str] | None = None,
-		bypass_csp: bool | None = None,
-		extra_http_headers: dict[str, str] | None = None,
-		ignore_https_errors: bool | None = None,
-		java_script_enabled: bool | None = None,
-		base_url: str | None = None,
-		service_workers: str | None = None,
 		user_agent: str | None = None,
 		screen: dict | None = None,
 		viewport: dict | None = None,
 		no_viewport: bool | None = None,
 		device_scale_factor: float | None = None,
-		is_mobile: bool | None = None,
-		has_touch: bool | None = None,
-		locale: str | None = None,
-		timezone_id: str | None = None,
-		color_scheme: str | None = None,
-		contrast: str | None = None,
-		reduced_motion: str | None = None,
-		forced_colors: str | None = None,
 		record_har_content: str | None = None,
 		record_har_mode: str | None = None,
-		record_har_omit_content: bool | None = None,
 		record_har_path: str | Path | None = None,
-		record_har_url_filter: str | None = None,
 		record_video_dir: str | Path | None = None,
-		record_video_size: dict | None = None,
 		# From BrowserLaunchPersistentContextArgs
 		user_data_dir: str | Path | None = None,
 		# From BrowserNewContextArgs
 		storage_state: str | Path | dict[str, Any] | None = None,
 		# BrowserProfile specific fields
-		stealth: bool | None = None,
 		disable_security: bool | None = None,
 		deterministic_rendering: bool | None = None,
 		allowed_domains: list[str] | None = None,
@@ -286,22 +261,23 @@ class BrowserSession(BaseModel):
 		window_size: dict | None = None,
 		window_position: dict | None = None,
 		cross_origin_iframes: bool | None = None,
-		default_navigation_timeout: float | None = None,
-		default_timeout: float | None = None,
 		minimum_wait_page_load_time: float | None = None,
 		wait_for_network_idle_page_load_time: float | None = None,
-		maximum_wait_page_load_time: float | None = None,
 		wait_between_actions: float | None = None,
-		include_dynamic_attributes: bool | None = None,
 		highlight_elements: bool | None = None,
-		viewport_expansion: int | None = None,
+		filter_highlight_ids: bool | None = None,
 		auto_download_pdfs: bool | None = None,
 		profile_directory: str | None = None,
-		cookies_file: Path | None = None,
 	):
 		# Following the same pattern as AgentSettings in service.py
 		# Only pass non-None values to avoid validation errors
 		profile_kwargs = {k: v for k, v in locals().items() if k not in ['self', 'browser_profile', 'id'] and v is not None}
+
+		# if is_local is False but executable_path is provided, set is_local to True
+		if is_local is False and executable_path is not None:
+			profile_kwargs['is_local'] = True
+		if not cdp_url:
+			profile_kwargs['is_local'] = True
 
 		# Create browser profile from direct parameters or use provided one
 		if browser_profile is not None:
@@ -455,7 +431,10 @@ class BrowserSession(BaseModel):
 
 	async def start(self) -> None:
 		"""Start the browser session."""
-		await self.event_bus.dispatch(BrowserStartEvent())
+		start_event = self.event_bus.dispatch(BrowserStartEvent())
+		await start_event
+		# Ensure any exceptions from the event handler are propagated
+		await start_event.event_result(raise_if_any=True, raise_if_none=False)
 
 	async def kill(self) -> None:
 		"""Kill the browser session and reset all state."""
@@ -559,6 +538,18 @@ class BrowserSession(BaseModel):
 
 		target_id = None
 
+		# If new_tab=True but we're already in a new tab, set new_tab=False
+		if event.new_tab:
+			try:
+				current_url = await self.get_current_page_url()
+				from browser_use.utils import is_new_tab_page
+
+				if is_new_tab_page(current_url):
+					self.logger.debug(f'[on_NavigateToUrlEvent] Already in new tab ({current_url}), setting new_tab=False')
+					event.new_tab = False
+			except Exception as e:
+				self.logger.debug(f'[on_NavigateToUrlEvent] Could not check current URL: {e}')
+
 		# check if the url is already open in a tab somewhere that we're not currently on, if so, short-circuit and just switch to it
 		targets = await self._cdp_get_all_pages()
 		for target in targets:
@@ -607,10 +598,18 @@ class BrowserSession(BaseModel):
 				# Use current tab
 				target_id = target_id or self.agent_focus.target_id
 
-			# Activate target (bring to foreground)
-			await self.event_bus.dispatch(SwitchTabEvent(target_id=target_id))
-			# which does this for us:
-			# self.agent_focus = await self.get_or_create_cdp_session(target_id)
+			# Only switch tab if we're not already on the target tab
+			if self.agent_focus is None or self.agent_focus.target_id != target_id:
+				self.logger.debug(
+					f'[on_NavigateToUrlEvent] Switching to target tab {target_id[-4:]} (current: {self.agent_focus.target_id[-4:] if self.agent_focus else "none"})'
+				)
+				# Activate target (bring to foreground)
+				await self.event_bus.dispatch(SwitchTabEvent(target_id=target_id))
+				# which does this for us:
+				# self.agent_focus = await self.get_or_create_cdp_session(target_id)
+			else:
+				self.logger.debug(f'[on_NavigateToUrlEvent] Already on target tab {target_id[-4:]}, skipping SwitchTabEvent')
+
 			assert self.agent_focus is not None and self.agent_focus.target_id == target_id, (
 				'Agent focus not updated to new target_id after SwitchTabEvent should have switched to it'
 			)
@@ -628,8 +627,8 @@ class BrowserSession(BaseModel):
 				session_id=self.agent_focus.session_id,
 			)
 
-			# Wait a bit to ensure page starts loading
-			await asyncio.sleep(0.5)
+			# # Wait a bit to ensure page starts loading
+			# await asyncio.sleep(0.5)
 
 			# Dispatch navigation complete
 			self.logger.debug(f'Dispatching NavigationCompleteEvent for {event.url} (tab #{target_id[-4:]})')
@@ -701,8 +700,8 @@ class BrowserSession(BaseModel):
 		"""Handle tab closure - update focus if needed."""
 
 		cdp_session = await self.get_or_create_cdp_session(target_id=None, focus=False)
-		await cdp_session.cdp_client.send.Target.closeTarget(params={'targetId': event.target_id})
 		await self.event_bus.dispatch(TabClosedEvent(target_id=event.target_id))
+		await cdp_session.cdp_client.send.Target.closeTarget(params={'targetId': event.target_id})
 
 	async def on_TabClosedEvent(self, event: TabClosedEvent) -> None:
 		"""Handle tab closure - update focus if needed."""
@@ -814,6 +813,8 @@ class BrowserSession(BaseModel):
 		assert self._cdp_client_root is not None, 'CDP client not initialized - browser may not be connected yet'
 		return self._cdp_client_root
 
+	@time_execution_async('get_or_create_cdp_session')
+	@observe_debug(ignore_input=True, ignore_output=True, name='get_or_create_cdp_session')
 	async def get_or_create_cdp_session(
 		self, target_id: TargetID | None = None, focus: bool = True, new_socket: bool | None = None
 	) -> CDPSession:
@@ -868,6 +869,8 @@ class BrowserSession(BaseModel):
 			cdp_url=self.cdp_url if should_use_new_socket else None,
 		)
 		self._cdp_session_pool[target_id] = session
+		# log length of _cdp_session_pool
+		self.logger.debug(f'[get_or_create_cdp_session] new _cdp_session_pool length: {len(self._cdp_session_pool)}')
 
 		# Only change agent focus if requested
 		if focus:
@@ -893,7 +896,7 @@ class BrowserSession(BaseModel):
 		return self.agent_focus.session_id if self.agent_focus else None
 
 	# ========== Helper Methods ==========
-
+	@observe_debug(ignore_input=True, ignore_output=True, name='get_browser_state_summary')
 	async def get_browser_state_summary(
 		self,
 		cache_clickable_elements_hashes: bool = True,
@@ -1070,7 +1073,8 @@ class BrowserSession(BaseModel):
 
 			# Run a tiny HTTP client to query for the WebSocket URL from the /json/version endpoint
 			async with httpx.AsyncClient() as client:
-				version_info = await client.get(url)
+				headers = self.browser_profile.headers or {}
+				version_info = await client.get(url, headers=headers)
 				self.browser_profile.cdp_url = version_info.json()['webSocketDebuggerUrl']
 
 		assert self.cdp_url is not None
@@ -1343,6 +1347,7 @@ class BrowserSession(BaseModel):
 		except Exception as e:
 			self.logger.debug(f'Skipping proxy auth setup: {type(e).__name__}: {e}')
 
+	@observe_debug(ignore_input=True, ignore_output=True, name='get_tabs')
 	async def get_tabs(self) -> list[TabInfo]:
 		"""Get information about all open tabs using CDP Target.getTargetInfo for speed."""
 		tabs = []
@@ -1421,6 +1426,7 @@ class BrowserSession(BaseModel):
 				return target
 		return None
 
+	@observe_debug(ignore_input=True, ignore_output=True, name='get_current_page_url')
 	async def get_current_page_url(self) -> str:
 		"""Get the URL of the current page using CDP."""
 		target = await self.get_current_target_info()
@@ -1541,6 +1547,9 @@ class BrowserSession(BaseModel):
 
 	async def remove_highlights(self) -> None:
 		"""Remove highlights from the page using CDP."""
+		if not self.browser_profile.highlight_elements:
+			return
+
 		try:
 			# Get cached session
 			cdp_session = await self.get_or_create_cdp_session()
